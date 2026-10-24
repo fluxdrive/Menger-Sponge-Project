@@ -1,0 +1,345 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Menger Sponge — HDR Ray Marcher</title>
+<style>
+  :root{ --void:#070912; --panel:#0e1320cc; --edge:#1d2740;
+    --ink:#e7ecf6; --mute:#7f8aa6; --accent:#6fd0e0; --warm:#e0a96f; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden;background:var(--void);color:var(--ink);
+    font-family:"SF Mono",ui-monospace,"Cascadia Code",Menlo,Consolas,monospace}
+  #gl{position:fixed;inset:0;display:block;touch-action:none;cursor:grab}
+  #gl:active{cursor:grabbing}
+  .panel{position:fixed;top:18px;left:18px;width:276px;max-height:calc(100vh - 36px);overflow:auto;
+    background:var(--panel);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+    border:1px solid var(--edge);border-radius:14px;padding:16px 16px 14px;
+    box-shadow:0 20px 60px #0009;user-select:none}
+  .title{font-size:13px;letter-spacing:.14em;text-transform:uppercase}
+  .sub{font-size:10.5px;letter-spacing:.08em;color:var(--mute);margin-top:3px}
+  .rule{height:1px;background:var(--edge);margin:12px 0}
+  .row{display:flex;align-items:baseline;justify-content:space-between;font-size:11px;
+    letter-spacing:.06em;color:var(--mute);margin:6px 0}
+  .row b{color:var(--ink);font-weight:600}
+  .val{color:var(--warm);font-variant-numeric:tabular-nums}
+  label.ctrl{display:flex;justify-content:space-between;font-size:10.5px;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--mute);margin:12px 0 6px}
+  label.ctrl .val{color:var(--accent)}
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:2px;
+    background:var(--edge);border-radius:2px;outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;
+    border-radius:50%;background:var(--accent);cursor:pointer;box-shadow:0 0 0 4px #6fd0e022}
+  input[type=range]::-moz-range-thumb{width:14px;height:14px;border:none;border-radius:50%;
+    background:var(--accent);cursor:pointer}
+  .toggles{display:flex;gap:7px;margin-top:13px;flex-wrap:wrap}
+  .toggles button{flex:1 1 28%;font:inherit;font-size:9.5px;letter-spacing:.05em;
+    text-transform:uppercase;color:var(--mute);background:transparent;border:1px solid var(--edge);
+    border-radius:9px;padding:8px 3px;cursor:pointer;transition:.15s}
+  .toggles button[aria-pressed=true]{color:var(--void);background:var(--accent);border-color:var(--accent)}
+  .toggles button:hover{color:var(--ink)}
+  .toggles button[aria-pressed=true]:hover{color:var(--void)}
+  .hint{font-size:10px;letter-spacing:.05em;color:var(--mute);line-height:1.5;margin-top:12px}
+  .dim{position:fixed;bottom:16px;right:18px;font-size:10px;letter-spacing:.08em;color:var(--mute)}
+  .dim span{color:var(--accent)}
+  @media (max-width:560px){.panel{width:calc(100% - 28px)}}
+</style>
+
+<canvas id="gl"></canvas>
+
+<div class="panel">
+  <div class="title">Menger Sponge</div>
+  <div class="sub">HDR ray marcher · reflections · DoF</div>
+  <div class="rule"></div>
+
+  <label class="ctrl" for="iter"><span>Iteration depth&nbsp; n</span><span class="val" id="iterv">4</span></label>
+  <input id="iter" type="range" min="0" max="7" step="1" value="4">
+  <label class="ctrl" for="focus"><span>Focus distance</span><span class="val" id="focusv">3.4</span></label>
+  <input id="focus" type="range" min="1.5" max="8" step="0.05" value="3.4">
+  <label class="ctrl" for="ap"><span>Aperture (DoF)</span><span class="val" id="apv">0.8</span></label>
+  <input id="ap" type="range" min="0" max="4" step="0.05" value="0.8">
+  <label class="ctrl" for="bloom"><span>Bloom</span><span class="val" id="bloomv">0.6</span></label>
+  <input id="bloom" type="range" min="0" max="1.5" step="0.01" value="0.6">
+  <label class="ctrl" for="exp"><span>Exposure</span><span class="val" id="expv">1.05</span></label>
+  <input id="exp" type="range" min="0.3" max="2.5" step="0.01" value="1.05">
+
+  <div class="rule"></div>
+  <div class="row"><span>cubes &nbsp;<b>20ⁿ</b></span><span id="count" class="val">160,000</span></div>
+  <div class="row"><span>volume &nbsp;<b>(20/27)ⁿ</b></span><span id="vol" class="val">0.301</span></div>
+
+  <div class="toggles">
+    <button id="spin" aria-pressed="true">Spin</button>
+    <button id="slice" aria-pressed="false">Cut</button>
+    <button id="glass" aria-pressed="false">Glass</button>
+    <button id="volume" aria-pressed="false">Rays</button>
+    <button id="hq" aria-pressed="false">2× SSAA</button>
+  </div>
+  <div class="hint">Drag orbit · scroll zoom. <b>Glass</b> and <b>Rays</b> (volumetric shafts) are the heavy modes — turn them on for stills, off for smooth orbiting.</div>
+</div>
+
+<div class="dim">D = log&#8202;20 / log&#8202;3 = <span>2.7268</span></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ===========================================================================
+//  Menger sponge ray marcher with: reflective floor + 1 reflection bounce,
+//  hemisphere/environment lighting, volumetric light shafts, glass/refraction
+//  (toggle), and depth of field (post pass driven by a depth written to alpha).
+//
+//  Passes: MARCH(HDR+depth) -> DOF -> BRIGHT -> BLUR x2 -> COMPOSITE(ACES).
+// ===========================================================================
+const canvas   = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:false, powerPreference:'high-performance' });
+renderer.setPixelRatio(1);
+
+const fsScene = new THREE.Scene();
+const fsCam   = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+const fsMesh  = new THREE.Mesh(new THREE.PlaneGeometry(2,2), null);
+fsScene.add(fsMesh);
+function pass(mat, target){ fsMesh.material = mat; renderer.setRenderTarget(target); renderer.render(fsScene, fsCam); }
+const passthru = `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position,1.0); }`;
+
+const marchFrag = `
+precision highp float;
+varying vec2 vUv;
+uniform vec2 u_res; uniform float u_time; uniform int u_iter;
+uniform vec3 u_camPos; uniform bool u_slice; uniform float u_sliceZ;
+uniform bool u_glass; uniform bool u_volume;
+
+#define LIGHTDIR normalize(vec3(0.65,0.85,0.45))
+#define FLOOR_Y -1.06
+
+float hash(vec2 p){ return fract(sin(dot(p, vec2(41.13,289.7)))*43758.5453); }
+
+float sdBox(vec3 p, vec3 b){ vec3 d=abs(p)-b; return length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0); }
+
+// LOD: only fold to the depth whose features are larger than ~one pixel.
+// Stops the float-precision blowup (s never gets huge) and kills sub-pixel aliasing.
+int lodIter(vec3 p){
+  float coneK = 0.9/(1.7*u_res.y);
+  float r = max(length(p-u_camPos)*coneK, 1e-6);
+  return int(clamp(floor(-log(r)/log(3.0)+0.5), 0.0, float(u_iter)));
+}
+float deMenger(vec3 p){
+  float d=sdBox(p,vec3(1.0)); float s=1.0; int it=lodIter(p);
+  for(int m=0;m<8;m++){ if(m>=it) break;
+    vec3 a=mod(p*s,2.0)-1.0; s*=3.0;
+    vec3 r=abs(1.0-3.0*abs(a));
+    float cross=(min(max(r.x,r.y),min(max(r.y,r.z),max(r.z,r.x)))-1.0)/s;
+    d=max(d,cross);
+  }
+  if(u_slice) d=max(d, p.z-u_sliceZ);
+  return d;
+}
+float orbitTrap(vec3 p){ float s=1.0,tr=1e9;
+  for(int m=0;m<8;m++){ if(m>=u_iter) break; vec3 a=mod(p*s,2.0)-1.0; s*=3.0; tr=min(tr,dot(a,a)); }
+  return tr;
+}
+vec3 normalMenger(vec3 p){ vec2 e=vec2(0.0006,0.0);
+  return normalize(vec3(deMenger(p+e.xyy)-deMenger(p-e.xyy),
+                        deMenger(p+e.yxy)-deMenger(p-e.yxy),
+                        deMenger(p+e.yyx)-deMenger(p-e.yyx))); }
+
+// scene = sponge (id 1) union reflective floor (id 2)
+vec2 mapScene(vec3 p){ float ms=deMenger(p); float fl=p.y-FLOOR_Y;
+  return (fl<ms)? vec2(fl,2.0) : vec2(ms,1.0); }
+vec3 calcNormal(vec3 p){ vec2 e=vec2(0.0006,0.0);
+  return normalize(vec3(mapScene(p+e.xyy).x-mapScene(p-e.xyy).x,
+                        mapScene(p+e.yxy).x-mapScene(p-e.yxy).x,
+                        mapScene(p+e.yyx).x-mapScene(p-e.yyx).x)); }
+
+// hemisphere environment used for sky, ambient, reflections and refractions
+vec3 sky(vec3 d){
+  vec3 zen=vec3(0.18,0.32,0.56), hor=vec3(0.50,0.55,0.64), gnd=vec3(0.05,0.06,0.09);
+  vec3 base = (d.y>0.0)? mix(hor,zen,pow(d.y,0.55)) : mix(hor,gnd,pow(-d.y,0.5));
+  base += vec3(1.0,0.9,0.7)*pow(max(dot(d,LIGHTDIR),0.0),64.0)*1.6;   // sun glow (HDR)
+  return base;
+}
+vec3 applyFog(vec3 c, vec3 rd, float t){ return mix(c, sky(rd), 1.0-exp(-0.010*t*t)); }
+vec3 hemiAmbient(vec3 n){ return mix(vec3(0.15,0.12,0.10), vec3(0.34,0.45,0.62), 0.5+0.5*n.y); }
+
+float softShadow(vec3 ro, vec3 rd){ float res=1.0,t=0.02;
+  for(int i=0;i<40;i++){ float h=mapScene(ro+rd*t).x; if(h<0.001) return 0.0;
+    res=min(res,12.0*h/t); t+=clamp(h,0.012,0.18); if(t>7.0) break; } return clamp(res,0.0,1.0); }
+float ao(vec3 p, vec3 n){ float occ=0.0,sca=1.0;
+  for(int i=0;i<5;i++){ float h=0.012+0.11*float(i); occ+=(h-mapScene(p+n*h).x)*sca; sca*=0.82; }
+  return clamp(1.0-1.7*occ,0.0,1.0); }
+vec3 palette(float t){ return 0.55+0.45*cos(6.2831*(vec3(0.0,0.33,0.66)+t)+0.7); }
+
+vec3 shadeOpaque(vec3 pos, vec3 nor, vec3 rd, float mat){
+  vec3 L=LIGHTDIR, V=-rd, H=normalize(L+V);
+  float NoL=max(dot(nor,L),0.0), NoV=max(dot(nor,V),0.0), NoH=max(dot(nor,H),0.0);
+  float F=0.04+0.96*pow(1.0-NoV,5.0);
+  float sh=softShadow(pos+nor*0.003,L), occ=ao(pos,nor);
+  vec3 albedo = (mat<1.5)? palette(orbitTrap(pos)*0.5+0.15) : vec3(0.07);
+  vec3 amb=albedo*occ*hemiAmbient(nor);
+  vec3 dif=albedo*NoL*sh*vec3(1.0,0.92,0.78)*1.45;
+  vec3 spec=vec3(1.0,0.95,0.85)*pow(NoH,48.0)*F*4.0;
+  vec3 rim=vec3(0.43,0.81,0.88)*pow(1.0-NoV,4.0)*F*1.4;
+  return amb+dif+spec+rim;
+}
+// single-bounce environment probe (no further recursion)
+vec3 envSample(vec3 ro, vec3 rd){ float t=0.0; bool hit=false; float mat=-1.0;
+  for(int i=0;i<120;i++){ vec2 h=mapScene(ro+rd*t);
+    if(h.x<0.0012*t+0.00002){ hit=true; mat=h.y; break; } t+=h.x*0.9; if(t>30.0) break; }
+  if(!hit) return sky(rd);
+  vec3 p=ro+rd*t, n=calcNormal(p);
+  return applyFog(shadeOpaque(p,n,rd,mat), rd, t);
+}
+// volumetric light shafts: integrate sun visibility through the medium
+float lightVis(vec3 p){ float res=1.0,t=0.03;
+  for(int i=0;i<22;i++){ float h=mapScene(p+LIGHTDIR*t).x; if(h<0.002) return 0.0;
+    res=min(res,10.0*h/t); t+=clamp(h,0.02,0.3); if(t>8.0) break; } return clamp(res,0.0,1.0); }
+vec3 volumetric(vec3 ro, vec3 rd, float tMax){
+  float far=min(tMax,16.0), stepS=far/24.0, t=stepS*hash(gl_FragCoord.xy), acc=0.0;
+  for(int i=0;i<24;i++){ float tt=t+float(i)*stepS; if(tt>far) break; acc+=lightVis(ro+rd*tt); }
+  return (acc/24.0)*vec3(1.0,0.86,0.62)*0.55;
+}
+// glass: Fresnel mix of reflected env and refracted env, tinted by path length
+vec3 glassShade(vec3 pos, vec3 nor, vec3 rd){
+  float ior=1.45;
+  float F=0.04+0.96*pow(1.0-max(dot(nor,-rd),0.0),5.0);
+  vec3 reflC=envSample(pos+nor*0.01, reflect(rd,nor));
+  vec3 rr=refract(rd,nor,1.0/ior);
+  vec3 p=pos-nor*0.02; float t=0.0;
+  for(int i=0;i<80;i++){ float d=deMenger(p+rr*t); if(d>0.0) break; t+=max(-d,0.004); if(t>4.0) break; }
+  vec3 exitP=p+rr*t;
+  vec3 nOut=normalMenger(exitP);
+  vec3 outDir=refract(rr,nOut,ior);
+  if(dot(outDir,outDir)<0.0001) outDir=reflect(rr,nOut);    // total internal reflection
+  vec3 tint=exp(-vec3(0.35,0.18,0.28)*t*2.2);               // Beer-Lambert colored glass
+  vec3 refrC=envSample(exitP+outDir*0.01, outDir)*tint;
+  return mix(refrC, reflC, F) + vec3(1.0,0.95,0.85)*pow(F,3.0)*0.4;
+}
+
+bool traceScene(vec3 ro, vec3 rd, out vec3 pos, out vec3 nor, out float mat, out float tout){
+  float t=0.0; mat=-1.0; bool hit=false;
+  for(int i=0;i<192;i++){ vec2 h=mapScene(ro+rd*t);
+    if(h.x<0.0009*t+0.00002){ mat=h.y; hit=true; break; } t+=h.x*0.9; if(t>42.0) break; }
+  tout=t; if(hit){ pos=ro+rd*t; nor=calcNormal(pos); } return hit;
+}
+
+void main(){
+  vec2 uv=(gl_FragCoord.xy-0.5*u_res)/u_res.y;
+  vec3 ro=u_camPos, cw=normalize(-ro);
+  vec3 cu=normalize(cross(cw,vec3(0.0,1.0,0.0))), cv=cross(cu,cw);
+  vec3 rd=normalize(uv.x*cu+uv.y*cv+1.7*cw);
+
+  vec3 pos,nor; float mat,t; bool hit=traceScene(ro,rd,pos,nor,mat,t);
+  vec3 col; float depth;
+  if(!hit){ col=sky(rd); depth=42.0; }
+  else{
+    depth=t;
+    if(u_glass && mat<1.5){ col=glassShade(pos,nor,rd); }
+    else{
+      col=shadeOpaque(pos,nor,rd,mat);
+      float refl=(mat<1.5)? (0.04+0.5*pow(1.0-max(dot(nor,-rd),0.0),5.0))*0.45 : 0.42;
+      col=mix(col, envSample(pos+nor*0.01, reflect(rd,nor)), refl);
+    }
+    col=applyFog(col, rd, t);
+  }
+  if(u_volume) col += volumetric(ro, rd, hit? t : 16.0);
+  gl_FragColor=vec4(col, depth);   // rgb = linear HDR, a = eye depth (for DoF)
+}
+`;
+
+// ---- DoF post pass: disk blur scaled by circle of confusion -----------------
+const dofFrag = `
+precision highp float; varying vec2 vUv;
+uniform sampler2D tDiffuse; uniform vec2 u_texel; uniform float u_focus; uniform float u_aperture;
+void main(){
+  vec4 c=texture2D(tDiffuse,vUv); float depth=c.a;
+  float coc=min(abs(depth-u_focus)*u_aperture*0.006, 0.03);   // radius in UV
+  if(coc<u_texel.y){ gl_FragColor=c; return; }
+  float asp=u_texel.x/u_texel.y, ga=2.39996323;
+  vec3 sum=c.rgb; float w=1.0;
+  for(int i=0;i<16;i++){ float fi=float(i)+1.0; float r=sqrt(fi/16.0)*coc; float a=fi*ga;
+    vec2 off=vec2(cos(a)*asp,sin(a))*r; sum+=texture2D(tDiffuse,vUv+off).rgb; w+=1.0; }
+  gl_FragColor=vec4(sum/w, depth);
+}`;
+const brightFrag = `
+precision highp float; varying vec2 vUv; uniform sampler2D tDiffuse; uniform float u_threshold;
+void main(){ vec3 c=texture2D(tDiffuse,vUv).rgb; float l=dot(c,vec3(0.2126,0.7152,0.0722));
+  gl_FragColor=vec4(c*smoothstep(u_threshold,u_threshold+0.7,l),1.0); }`;
+const blurFrag = `
+precision highp float; varying vec2 vUv; uniform sampler2D tDiffuse; uniform vec2 u_dir;
+void main(){ vec3 c=texture2D(tDiffuse,vUv).rgb*0.227027;
+  c+=texture2D(tDiffuse,vUv+u_dir*1.3846).rgb*0.316216; c+=texture2D(tDiffuse,vUv-u_dir*1.3846).rgb*0.316216;
+  c+=texture2D(tDiffuse,vUv+u_dir*3.2308).rgb*0.070270; c+=texture2D(tDiffuse,vUv-u_dir*3.2308).rgb*0.070270;
+  gl_FragColor=vec4(c,1.0); }`;
+const compositeFrag = `
+precision highp float; varying vec2 vUv; uniform sampler2D tScene; uniform sampler2D tBloom;
+uniform float u_bloom; uniform float u_exposure;
+vec3 aces(vec3 x){ const float a=2.51,b=0.03,c=2.43,d=0.59,e=0.14;
+  return clamp((x*(a*x+b))/(x*(c*x+d)+e),0.0,1.0); }
+void main(){ vec3 hdr=texture2D(tScene,vUv).rgb + texture2D(tBloom,vUv).rgb*u_bloom;
+  hdr*=u_exposure; vec3 m=pow(aces(hdr),vec3(0.4545));
+  vec2 q=vUv-0.5; m*=1.0-0.45*dot(q,q); gl_FragColor=vec4(m,1.0); }`;
+
+// ---- uniforms / materials --------------------------------------------------
+const U={ res:{value:new THREE.Vector2()}, time:{value:0}, iter:{value:4},
+  camPos:{value:new THREE.Vector3()}, slice:{value:false}, sliceZ:{value:0.0},
+  glass:{value:false}, volume:{value:false} };
+const marchMat=new THREE.ShaderMaterial({vertexShader:passthru,fragmentShader:marchFrag,uniforms:{
+  u_res:U.res,u_time:U.time,u_iter:U.iter,u_camPos:U.camPos,u_slice:U.slice,u_sliceZ:U.sliceZ,u_glass:U.glass,u_volume:U.volume}});
+const dofMat=new THREE.ShaderMaterial({vertexShader:passthru,fragmentShader:dofFrag,uniforms:{
+  tDiffuse:{value:null},u_texel:{value:new THREE.Vector2()},u_focus:{value:3.4},u_aperture:{value:0.8}}});
+const brightMat=new THREE.ShaderMaterial({vertexShader:passthru,fragmentShader:brightFrag,uniforms:{tDiffuse:{value:null},u_threshold:{value:1.0}}});
+const blurMat=new THREE.ShaderMaterial({vertexShader:passthru,fragmentShader:blurFrag,uniforms:{tDiffuse:{value:null},u_dir:{value:new THREE.Vector2()}}});
+const compositeMat=new THREE.ShaderMaterial({vertexShader:passthru,fragmentShader:compositeFrag,uniforms:{tScene:{value:null},tBloom:{value:null},u_bloom:{value:0.6},u_exposure:{value:1.05}}});
+
+const RTO={type:THREE.HalfFloatType,minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,format:THREE.RGBAFormat,depthBuffer:false,stencilBuffer:false};
+let rtScene,rtDof,rtBright,rtBlurA,rtBlurB;
+function makeTargets(w,h){ [rtScene,rtDof,rtBright,rtBlurA,rtBlurB].forEach(rt=>rt&&rt.dispose());
+  rtScene=new THREE.WebGLRenderTarget(w,h,RTO); rtDof=new THREE.WebGLRenderTarget(w,h,RTO);
+  const hw=Math.max(1,w>>1),hh=Math.max(1,h>>1);
+  rtBright=new THREE.WebGLRenderTarget(hw,hh,RTO); rtBlurA=new THREE.WebGLRenderTarget(hw,hh,RTO); rtBlurB=new THREE.WebGLRenderTarget(hw,hh,RTO);
+}
+
+// ---- camera ----------------------------------------------------------------
+let theta=0.7,phi=1.02,radius=3.4,dragging=false,px=0,py=0;
+let spin=!window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+function placeCamera(){ U.camPos.value.set(radius*Math.sin(phi)*Math.cos(theta),radius*Math.cos(phi),radius*Math.sin(phi)*Math.sin(theta)); }
+canvas.addEventListener('pointerdown',e=>{dragging=true;px=e.clientX;py=e.clientY;canvas.setPointerCapture(e.pointerId);});
+canvas.addEventListener('pointerup',()=>dragging=false);
+canvas.addEventListener('pointermove',e=>{ if(!dragging)return;
+  theta-=(e.clientX-px)*0.0095; phi=Math.max(0.06,Math.min(Math.PI-0.06,phi-(e.clientY-py)*0.0095));
+  px=e.clientX;py=e.clientY; });
+canvas.addEventListener('wheel',e=>{e.preventDefault();radius=Math.max(1.7,Math.min(11.0,radius*(1+e.deltaY*0.0011)));},{passive:false});
+
+// ---- controls --------------------------------------------------------------
+const $=id=>document.getElementById(id), fmt=n=>n.toLocaleString('en-US');
+function refreshMath(n){ $('iterv').textContent=n; $('count').textContent=fmt(Math.pow(20,n)); $('vol').textContent=Math.pow(20/27,n).toPrecision(3); }
+$('iter').addEventListener('input',e=>{const n=+e.target.value;U.iter.value=n;refreshMath(n);});
+$('focus').addEventListener('input',e=>{dofMat.uniforms.u_focus.value=+e.target.value;$('focusv').textContent=(+e.target.value).toFixed(2);});
+$('ap').addEventListener('input',e=>{dofMat.uniforms.u_aperture.value=+e.target.value;$('apv').textContent=(+e.target.value).toFixed(2);});
+$('bloom').addEventListener('input',e=>{compositeMat.uniforms.u_bloom.value=+e.target.value;$('bloomv').textContent=(+e.target.value).toFixed(2);});
+$('exp').addEventListener('input',e=>{compositeMat.uniforms.u_exposure.value=+e.target.value;$('expv').textContent=(+e.target.value).toFixed(2);});
+$('spin').addEventListener('click',e=>{spin=!spin;e.target.setAttribute('aria-pressed',String(spin));});
+$('slice').addEventListener('click',e=>{U.slice.value=!U.slice.value;e.target.setAttribute('aria-pressed',String(U.slice.value));});
+$('glass').addEventListener('click',e=>{U.glass.value=!U.glass.value;e.target.setAttribute('aria-pressed',String(U.glass.value));});
+$('volume').addEventListener('click',e=>{U.volume.value=!U.volume.value;e.target.setAttribute('aria-pressed',String(U.volume.value));});
+let scale=1.4;
+$('hq').addEventListener('click',e=>{const on=e.target.getAttribute('aria-pressed')!=='true';e.target.setAttribute('aria-pressed',String(on));scale=on?2.2:1.4;resize();});
+
+function resize(){ const cw=window.innerWidth,ch=window.innerHeight;
+  const W=Math.max(2,Math.floor(cw*scale)),H=Math.max(2,Math.floor(ch*scale));
+  renderer.setSize(W,H,false); canvas.style.width=cw+'px'; canvas.style.height=ch+'px';
+  U.res.value.set(W,H); dofMat.uniforms.u_texel.value.set(1/W,1/H); makeTargets(W,H); }
+window.addEventListener('resize',resize);
+$('spin').setAttribute('aria-pressed',String(spin));
+resize(); refreshMath(4);
+
+const clock=new THREE.Clock();
+function loop(){ requestAnimationFrame(loop);
+  const dt=clock.getDelta(); U.time.value+=dt; if(spin&&!dragging) theta+=dt*0.18; placeCamera();
+  pass(marchMat, rtScene);                                    // 1. HDR + depth
+  dofMat.uniforms.tDiffuse.value=rtScene.texture; pass(dofMat, rtDof);   // 2. depth of field
+  brightMat.uniforms.tDiffuse.value=rtDof.texture; pass(brightMat, rtBright);  // 3. bright
+  const hw=rtBright.width,hh=rtBright.height;                 // 4. separable blur
+  for(let i=0;i<2;i++){
+    blurMat.uniforms.tDiffuse.value=(i===0?rtBright:rtBlurA).texture; blurMat.uniforms.u_dir.value.set(1/hw,0); pass(blurMat,rtBlurB);
+    blurMat.uniforms.tDiffuse.value=rtBlurB.texture; blurMat.uniforms.u_dir.value.set(0,1/hh); pass(blurMat,rtBlurA);
+  }
+  compositeMat.uniforms.tScene.value=rtDof.texture; compositeMat.uniforms.tBloom.value=rtBlurA.texture; pass(compositeMat,null); // 5. composite
+}
+loop();
+</script>
